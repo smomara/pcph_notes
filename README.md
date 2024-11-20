@@ -80,7 +80,7 @@ When one task depends on another, they must be performed sequentially.
 
 In this example, `x` is unevaluated
 
-```Haskell
+```shell
 ghci> let x = 1 + 2 :: Int
 ghci> :sprint x
 x = _
@@ -92,7 +92,7 @@ applied to the integers `1` and `2`.
 
 Let's look at another example:
 
-```Haskell
+```shell
 ghci> let x = 1 + 2 :: Int
 ghci> import Data.Tuple
 ghci> let z = swap (x,x+1)
