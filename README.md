@@ -1190,3 +1190,869 @@ However, bear in mind these tradeoffs:
 * `Eval` has more diagnostics in ThreadScope.
 * `Par` does not support speculative parallelism:
   parallelism in the `Par` monad is always executed.
+
+## Concurrent Haskell
+
+GHC provides lightweight threads.
+The built-in functionality is sparse, but general so we can implement our own abstractions
+
+Therefore, we will learn the low-level features and build up higher-level abstractions
+to learn Concurrent Haskell.
+
+## Basic Concurrency: Threads and MVars
+
+The fundamental action in concurrency is forking a new thread of control:
+
+```Haskell
+forkIO :: IO () -> IO ThreadId
+```
+
+This operation takes in the type `IO ()`:
+a computation in the `IO` monad that eventually delivers a value of type `()`.
+This computation is executed in a new concurrent thread.
+If the thread has effects, they will be interleaved indeterminately with
+the effects of other threads.
+
+In Haskell, the program terminates when `main` returns,
+even if other threads are still running.
+
+### Communication: MVars
+
+The API for `MVar` is as follows:
+
+```Haskell
+data MVar a -- abstract
+
+newEmptyMVar :: IO (MVar a)
+newMVar :: a -> IO (MVar a)
+takeMVar :: MVar a -> IO a
+putMVar :: MVar a -> a -> IO ()
+```
+
+An `MVar` can be thought of like a box.
+We have a function that creates an empty box,
+and a general one that creates a full box containing the value passed as argument.
+`takeMVar` removes the value from the box and returns it,
+but waits if the box is currently empty.
+Symmetrically, `putMVar` puts a value into the `MVar`,
+but waits if the box is currently full.
+
+This is the fundamental building block that generalizes many different
+communication and synchronization patterns. Here are the main ways it can be used:
+
+* passing messages between threads, holding one message at a time, since its a
+  *one-place channel*
+* as a container for shared mutable state, taking the current value,
+  then placing a new value back in it
+* as a building block for larger concurrent data structures
+
+### MVar as a Simple Channel: A Logging Service
+
+Our logging service will have the following API:
+
+```Haskell
+data Logger
+
+initLogger :: IO Logger
+logMessage :: Logger -> String -> IO ()
+logStop :: Logger -> IO ()
+```
+
+There's an abstract data type that represents a handle to the logging service,
+and a new logging service is created with `initLogger`.
+Having `Logger` be a value that we pass around (rather than a top-level global)
+is good practice, it means we could have multiple loggers for example.
+
+Then we have the two operations. The stop operation is important because we want
+to make sure all messages have been logged before we terminate the program.
+
+Let's implement incrementally:
+
+```Haskell
+data Logger = Logger (MVar LogCommand)
+
+data LogCommand = Message String
+                | Stop (MVar ())
+```
+
+The `Logger` is just an `MVar` that we use as a channel for communication with
+the logging thread.
+
+There are two kinds of requests we can make, so `LogCommand` takes either the
+straightforward `Message` or a `Stop` that contains `MVar ()` to enable the sender
+of the stop request to wait for a reply from the logging thread that indicates
+its finished.
+
+Now let's implement initialization, where we create an empty `MVar` for
+the channel and fork a thread to perform the service (the `logger` function):
+
+```Haskell
+initLogger :: IO Logger
+initLogger = do
+    m <- newEmptyMVar
+    let l = Logger m
+    forkIO (logger l)
+    return l
+
+logger :: Logger -> IO ()
+logger (Logger m) = loop
+  where
+    loop = do
+        cmd <- takeMVar m
+        case cmd of
+            Message msg -> do
+                putStrLn msg
+                loop
+            Stop s -> do
+                putStrLn "logger: stop"
+                putMVar s ()
+```
+
+The `logger` function recursively retrieves the next `LogCommand` from the `MVar`.
+If it is a message, it just prints it and recurses.
+If it is a stop command, it puts the unit value into the `MVar` from the command,
+then returns, causing the logger thread to exit.
+
+The implementation of the rest of the functions are trivial:
+
+```Haskell
+logMessage :: Logger -> String -> IO ()
+logMessage (Logger m) s = putMVar m (Message s)
+
+logStop :: Logger -> IO ()
+logStop (Logger m) = do
+    s <- newEmptyMVar
+    putMVar m (Stop s)
+    takeMVar s
+```
+
+`logStop` creates an `MVar` to hold the response, then sends a stop command to the
+logger containing the new empty `MVar`. After sending the command, we call `takeMVar`
+on the new `MVar` to wait for the response.
+
+Here's an trivial example:
+
+```Haskell
+main :: IO ()
+main = do
+    l <- initLogger
+    logMessage l "hello"
+    logMessage l "bye"
+    logStop l
+```
+
+### MVar as a Container for Shared State
+
+Concurrent programs often share mutable state that we usually need to perform
+operations on. We need to be able to perform these operations in a way
+that appears atomic from the POV of other threads (other threads should not
+be able to view intermediate states, nor be able to initiate their own
+operations while another operation is in progress).
+
+`MVar` can act as a sort of lock, where `takeMVar` acquires the lock,
+and `putMVar` releases it.
+
+Let's go through an example of a phonebook as a piece of mutable state:
+
+```Haskell
+type Name = String
+type PhoneNumber = String
+type PhoneBook = Map Name PhoneNumber
+
+newtype PhoneBookState = PhoneBookState (MVar PhoneBook)
+
+new :: IO PhoneBookState
+new = do
+    m <- newMVar Map.empty
+    return (PhoneBookState m)
+
+insert :: PhoneBookState -> Name -> PhoneNumber -> IO ()
+insert (PhoneBookState m) name number = do
+    book <- takeMVar m
+    putMVar m (Map.insert name number book)
+```
+
+This shows an important principle:
+we can take *any* pure immutable data structure such as `Map` and
+turn it into mutable shared state simply by wrapping in an `MVar`
+
+It's important to understand the effect of laziness in this line:
+
+```Haskell
+putMVar m (Map.insert name number book)
+```
+
+This places in the `MVar` the *unevaluated* expression.
+This can be good, because then we only hold the lock very briefly.
+However, if we were to do many `insert` operations consecutively,
+the `MVar` would build up a large chain of unevaluated expressions,
+creating a space leak. As an alternative, we could force evaluation:
+
+```Haskell
+putMVar m $! Map.insert name number book
+```
+
+To get brief locking *and* no space leaks, we can do this:
+
+```Haskell
+let book' = Map.insert name number book
+putMVar m book'
+seq book' (return ())
+```
+
+This stores the unevaluated expression in the `MVar`,
+then immediately evaluates it. So, the lock is held only briefly, and
+the thunk is evaluated.
+
+### MVar as a Building Block: Unbounded Channels
+
+Let's build a larger abstraction with `MVar`:
+an unbounded buffer channel. Here's the interface:
+
+```Haskell
+type Stream a = MVar (Item a)
+data Item a   = Item a (Stream a)
+
+data Chan a
+  = Chan (MVar (Stream a))
+         (MVar (Stream a))
+
+newChan :: IO (Chan a)
+newChan = do
+  hole  <- newEmptyMVar
+  readVar  <- newMVar hole
+  writeVar <- newMVar hole
+  return (Chan readVar writeVar)
+
+writeChan :: Chan a -> a -> IO ()
+writeChan (Chan _ writeVar) val = do
+  newHole <- newEmptyMVar
+  oldHole <- takeMVar writeVar
+  putMVar oldHole (Item val newHole)
+  putMVar writeVar newHole
+
+readChan :: Chan a -> IO a
+readChan (Chan readVar _) = do
+  stream <- takeMVar readVar
+  Item val tail <- readMVar stream
+  putMVar readVar tail
+  return val
+```
+
+Programming larger structures with `MVar` can be pretty tricky to reason about
+and avoid deadlocks/race conditions (this is where STM comes in).
+
+## Overlapping Input/Output
+
+Let's look at an exapmle that asynchronously downloads files from a URL:
+
+```Haskell
+sites :: [String]
+
+data Async a = Async (MVar a)
+
+async :: IO a -> IO (Async a)
+async action = do
+    var <- newEmptyMVar
+    forkIO (do r <- action; putMVar var r)
+    return (Async var)
+
+wait :: Async a -> IO a
+wait (Async var) = readMVar var
+
+main = do
+    as <- mapM (async . getURL) sites
+    rs <- mapM wait as
+    print rs
+```
+
+This example ignores exceptions and error handling. Let's investigate how that works.
+
+### Exceptions in Haskell
+
+Haskell has no built-in semantics for exception handling;
+everything is done with library functions.
+
+Exceptions are thrown with this function:
+
+```Haskell
+throw :: Exception e => e -> a
+```
+
+Note that it takes any type that is an instance of the `Exception` type class and
+returns the unrestricted type variable `a`, so it can be called from anywhere.
+
+The `Exception` type class is defined as follows:
+
+```Haskell
+class (Typeable e, Show e) => Exception e where
+    -- ...
+```
+
+So, any type that is an instance of both `Typeable` and `Show` can be an `Exception`.
+
+One common type used as an exception is `ErrorCall`:
+
+```Haskell
+newtype ErrorCall = ErrorCall String
+    deriving (Typeable)
+
+instance Show ErrorCall where {...}
+
+instance Exception ErrorCall
+
+-- now we can throw an ErrorCall like so
+throw (ErrorCall "oops!")
+```
+
+The function `error` from the prelude does exactly this:
+
+```Haskell
+error :: String -> a
+error s = throw (ErrorCall s)
+```
+
+I/O operations throw exceptions to indicate errors, usually `IOException` type.
+Operations for `IOException` are in `System.IO.Error` library.
+
+Exceptions can be caught, but only in the IO monad:
+
+```Haskell
+catch :: Exception e => IO a -> (e -> IO a) -> IO a
+```
+
+The two arguments are: the IO operation to perform and
+an exception handler of type `e -> IO a` where `e` must be an instance of
+the `Exception` class.
+
+The IO operation in the first argument is performed, and if it throws an exception
+of the type expected by the handler, `catch` executes the handler,
+passing in the exception value that was thrown.
+
+Sometimes it is more convenient to use the `try` variant:
+
+```Haskell
+try :: Exception e => IO a -> IO (Either e a)
+```
+
+For example,
+
+```shell
+> try (readFile "nonexistent") :: IO (Either IOException String)
+Left nonexistent: openFile: does not exist (No such file or directory)
+```
+
+Another variant of `catch` is `handle`, which is just `catch` with args reversed:
+
+```Haskell
+handle :: Exception e => (e -> IO a) -> IO a -> IO a
+```
+
+This is useful when the exception handler is short, but the action is long:
+
+```Haskell
+handle (\e -> ...) $ do
+    ...
+```
+
+We can also perform some operation if an exception is raised and
+then re-throw the exception with `onException`:
+
+```Haskell
+onException :: IO a -> IO b -> IO a
+onException io what
+    = io `catch` \e -> do _ <- what
+                          throwIO (e :: SomeException)
+```
+
+Last is two useful higher-level abstractions, `bracket` and `finally`:
+
+```Haskell
+bracket :: IO a -> (a -> IO b) -> (a -> IO c) -> IO c
+
+finally :: IO a -> IO b -> IO a
+```
+
+`bracket` allows us to set up an exception handler to deallocate a resource or
+perform some sort of cleanup operation. For example, suppose we want to create a
+temporary file, perfom some operation, and have the temporary file reliable
+removed afterward - even if an exception occured during the operation.
+We would use `bracket`:
+
+```Haskell
+bracket (newTempFile "temp") -- allocates resource, result used as arg for next two
+        (\file -> removeFile file) -- deallocates resource
+        (\file -> ...) -- the operation to perform
+```
+
+`bracket` can be defined like so:
+
+```Haskell
+bracket IO a -> (a -> IO b) -> (a -> IO c) -> IO c
+bracket before after during = do
+    a <- before
+    c <- during a `onException` after a
+    after a
+    return c
+```
+
+`finally` is a special case of `bracket` that can be defined like so:
+
+```Haskell
+finally :: IO a -> IO b -> IO a
+finally io after = do
+    io `onException` after
+    after
+```
+
+### Error Handling with Async
+
+To handle errors in our last example, we will need to handle when the `Async`
+operation throws an exception by wrapping the action in `try`:
+
+```Haskell
+data Async a = Async (Mvar (Either SomeException a))
+
+async :: IO a -> IO (Async a)
+async action = do
+    var <- newEmptyMVar
+    forkIO (do r <- try action; putMVar var r)
+    return (Async var)
+
+waitCatch :: Async a -> IO (Either SomeException a)
+waitCatch (Async var) = readMVar var
+
+wait :: Async a -> IO a
+wait a = do
+    r <- waitCatch a
+    case r of
+        Left e -> throwIO e
+        Right a -> return a
+```
+
+`waitCatch` allows the caller to handle the error immediately,
+while `wait` rethrows the error to propogate it.
+
+### Merging
+
+Suppose we want to wait for one of several events to occur. For example,
+say we just want to wait for one of sites to complete downloading.
+
+We could modify the `getURL` example to feed all the results into the same
+`MVar` like this:
+
+```Haskell
+sites :: [String]
+
+main :: IO ()
+main = do
+    m <- newEmptyMVar
+    let
+        download url = do
+            r <- getURL url
+            purMVar m (url, r)
+
+    mapM_ (forkIO . download) sites
+
+    (url, r) <- takeMVar m
+    printf "%s was first (%d bytes)" url (B.length r)
+    replicateM_ (length sites - 1) (takeMVar m)
+```
+
+This puts all the results in the same `MVar`, but only prints the first one,
+then waits for the rest to complete before the program is done executing,
+telling us which was the quickest to download.
+
+This can be a bit inconvenient to arrange so all events feed to the same `MVar`,
+lets extend our Async API to allow waiting for two Asyncs simultaneously:
+
+```Haskell
+waitEither :: Async a -> Async b -> IO (Either a b)
+wait Either a b = do
+    m <- newEmptyMVar
+    forkIO $ do r <- try (fmap Left (wait a)); putMVar m r
+    forkIO $ do r <- try (fmap Right (wait b)); putMVar m r
+    wait (Async m)
+```
+
+We can generalize this to wait for a list of Asyncs:
+
+```Haskell
+waitAny :: [Async a] -> IO a
+waitAny as = do
+    m <- newEmptyMVar
+    let forkwait a = forkIO $ do r <- try (wait a); putMVar m r
+    mapM_ forkwait as
+    wait (Async m)
+```
+
+Now, we can simplify the changes to the `main` function:
+
+```Haskell
+main :: IO
+main = do
+    let
+        download url = do
+            r <- getURL url
+            return (url, r)
+
+    as <- mapM (async . download) sites
+
+    (url, r) <- waitAny as
+    printf "%s was first (%d bytes)\n" url (B.length r)
+    mapM_ wait as
+```
+
+(STM will later solve the issue of needing to create a new thread
+for every operation in this example)
+
+## Cancellation and Timeouts
+
+It's often important for one thread to be able to interrupt the execution of
+another thread. Such as a user closing the application, a timeout, or
+changing the parameters of a long compute-intensive task as its executing.
+
+The design decision is whether or not the intended victim thread should
+have to poll for the cancellation condition or whether the thread is immediately
+cancelled in some way. This is a tradeoff:
+
+1. Possible that polling is not regular, and the thread will become unresponsive,
+   leading to deadlocks and hangs.
+2. Asynchronous cancellation calls for critical sections that modify state
+   needing to be protected from cancellation. Otherwise, cancellation may occur
+   mid-update, leaving some data in an inconsistent state.
+
+Fully asynchronous cancellation is the default in Haskell since most code
+is purely functional able to be safely suspended and unable to poll.
+Therefore, the design decision reduces to deciding how cancellation is handled
+by code in the `IO` monad.
+
+### Asynchronous Exceptions
+
+An **asynchronous exception** is asynchronous from the point of view of the victim;
+they didn't ask for it and it can arrive at any time.
+
+Conversely, a **synchronous exception** are thrown using the normal
+`throw` and `throwIO`.
+
+To initiate an asynchronous exception, we use `throwTo`,
+which throws an exception from one thread to another:
+
+```Haskell
+throwTo :: Exception e => ThreadId -> e -> IO ()
+```
+
+The exception must be an instance of the `Exception` class. The `ThreadId` is
+returned by a previous call to `forkIO` and may refer to a thread in any state.
+
+Let's look at an example of asynchronous exceptions in our Async API:
+
+```Haskell
+-- this will cancel an existing Async
+cancel :: Async a -> IO
+
+-- we will need to store the ThreadId of the thread running Async for this to work
+data Async a = Async ThreadId (MVar (Either SomeException a))
+
+-- here's how we will implement cancel with these changes
+cancel (Async t var) = throwTo t ThreadKilled
+
+-- the async operator will need to store the ThreadId, too
+async :: IO a -> IO (Async a)
+async action = do
+    m <- newEmptyVar
+    t <- forkIO (do r <- try actoin; putMVar m r)
+    return (Async t m)
+
+-- now we're ready to update main to support quitting
+main = do
+    as <- mapM (async . timeDownload) sites
+
+    forkIO $ do -- new thread to poll for quit
+        hSetBuffering stdin NoBuffering
+        forever $ do
+            c <- getChar
+            when (c == 'q') $ mapM_ cancel as
+
+    rs <- mapM waitCatch as
+    printf "%d/$d succeeded\n" (length (right rs)) (length rs)
+```
+
+### Masking Asynchronous Exceptions
+
+We need a way to control the delivery of asynchronous exceptions in case
+the exception is made while the victim thread is updating some shared state.
+
+If a thread wishes to take an `MVar`, perform an operation depending on
+the value in it, then put the result back in it, the code must be responsive
+to asynchronous exceptions, but it should be safe.
+If an exception arrives after the `takeMVar` but before the final `putMVar`,
+the `MVar` should not be left empty, the original value should be restored.
+
+Here's the problem:
+
+```Haskell
+problem :: MVar a -> (a -> IO a) -> IO ()
+problem m f = do
+    a <- takeMVar m
+    r <- f a `catch` \e -> do putMVar m a; throw e
+    putMVar m r
+```
+
+If the exception hits between any of the lines of the function,
+the invariant will be violated. To fix this, we must use the `mask` combinator:
+
+```Haskell
+mask :: ((IO a -> IO a) -> IO b) -> IO b
+```
+
+`mask` defers the delivery of asynchronous exceptions for the duration of its argument.
+Let's look at an example:
+
+```Haskell
+problem :: MVar a -> (a -> IO a) -> IO ()
+problem m f = mask $ \restore -> do
+    a <- takeMVar m
+    r <- restore (f a) `catch` \e -> do putMVar m a; throw e
+    putMVar m r
+```
+
+`mask` is applied to a function, which takes as its argument a `restore` function.
+Now, exceptions can only be raised while `(f a)` is working, and we have an
+exception handler to catch exceptions in that case.
+
+We can provie higher-level combinators to insulate programmers from
+the need to use mask directly. For example, `problem` is given as
+`modifyMVar_` in the `Control.Concurrent.MVar` library:
+
+```Haskell
+modifyMVar_ :: MVar a -> (a -> IO a) -> IO ()
+
+-- also a variant that allows the operation to return a separate result in addition
+-- to the new contents of the MVar
+modifyMVar :: MVar a -> (a -> IO (a, b)) -> IO b
+```
+
+Here's a simple example of `modifyMVar`, used to implement compare and swap:
+
+```Haskell
+casMVar :: Eq a => MVar a -> a -> a -> IO Bool
+casMVar m old new =
+    modifyMVar m $ \cur ->
+        if cur == old
+           then return (new,True)
+           else return (cur,False)
+```
+
+This function returns the the new value and `True` if the `MVar` contents are old,
+otherwise it returns the current contents and `False`.
+
+Here's an example working on multiple `MVar`s by nesting calls to `modifyMVar`:
+
+```Haskell
+modifyTwo :: MVar a -> MVar b -> (a -> b -> IO (a, b)) -> IO ()
+modifyTwo ma mb f =
+    modifyMVar_ mb $ \b ->
+        modifyMVar ma $ \a -> f a b
+```
+
+### The `bracket` Operation
+
+`bracket` is actually defined with `mask` to make it safe in the presence
+of asynchronous exceptions:
+
+```Haskell
+bracket :: IO a -> (a -> IO b) -> (a -> IO c) -> IO c
+bracket before after thing =
+    mask $ \restore -> do
+        a <- before
+        r <- restore (thing a) `onException` after a
+        _ <- after a
+        return r
+```
+
+`before` and `after` are performed inside a `mask`.
+
+### Asynchronous Exception Safety for Channels
+
+In most `MVar` code, we can use operations like `modifyMVar` insteadof `takeMVar`
+and `putMVar` to make our code safe in the presence of asynchronous exceptions.
+
+For example, here's how we can prevent deadlocks from asynchronous exceptions
+in `readChan`:
+
+```Haskell
+-- old impl
+readChan :: Chan a -> IO a
+readChan (Chan readVar _) = do
+    stream <- takeMVar readVar
+    Item val new <- readMVar stream
+    putMVar readVar new
+    return val
+
+-- new impl
+readChan :: Chan a -> IO a
+readChan (Chan readVar _) = do
+    modifyMVar readVar $ \stream -> do
+        Item val tail <- readMVar stream
+        return (tail, val)
+```
+
+Now let's do the same thing for `writeChan`:
+
+```Haskell
+-- old impl
+writeChan :: Chan a -> a -> IO ()
+writeChan (Chan _ writeVar) val = do
+    newHole <- newEmptyMVar
+    oldHole <- takeMVar writeVar
+    putMVar oldHole (Item val newHole)
+    putMVar writeVar newHole
+
+-- first thought
+writeChan :: Chan a -> a -> IO ()
+writeChan (Chan _ writeVar) val = do
+    newHole <- newEmptyMVar
+    modifyMVar_ writeVar $ \oldHole -> do
+        putMVar oldHole (Item val newHole)
+        return newHole
+-- this wont work because an exception could strike between putMVar and return
+
+-- heres the proper impl
+writeChan :: Chan a -> a -> IO ()
+writeChan (Chan _ writeVar) val = do
+    newHole <- newEmptyMVar
+    mask_ $ do
+        oldHole <- takeMVar writeVar
+        putMVar oldHole (Item val newHole)
+        putMVar writeVar oldHole
+```
+
+Note that the two `putMVar`s are guaranteed not to block,
+so they are not interruptible.
+
+### Timeouts
+
+To write a timeout function, we fork a new thread that will wait for
+`t` microseconds and then call `throwTo` to throw the `Timeout` exception
+back to the original thread. If the operatoin completes within the time limit,
+then we must ensure that this thread never throws its `Timeout` exception,
+so `timeout` must kill the thread before returning.
+
+```Haskell
+timeout :: Int -> IO a -> IO (Maybe a)
+timeout t m
+    | t < 0 = fmap Just m
+    | t == 0 = return Nothing
+    | otherwise = do
+        pid <- myThreadId
+        u <- newUnique
+        let ex = Timeout u
+        handleJust
+            (\e -> if e == ex then Just () else Nothing)
+            (\_ -> return Nothing)
+            (bracket (forkIO $ do threadDelay t
+                                  throwTo pid ex)
+                     (\tid -> throwTo tid ThreadKilled)
+                     (\_ -> fmap Just m)
+```
+
+### Catching Asynchronous Exceptions
+
+Async exceptions propogate like normal exceptions but need special handling.
+
+Haskell automatically masks async exceptions inside exception handlers.
+
+Main pitfall: tail-calling from handlers keeps programs masked accidentally.
+
+Use `try` instead of `catch`/`handle` when possible to avoid masking issues.
+
+Keep exception handling scope narrow and avoid nesting handlers.
+
+For example:
+
+```Haskell
+-- BAD (stays masked)
+main = do
+    fs <- getArgs
+    let
+        loop n! [] = return n
+        loop n! (f:fs)
+            = handle (\e -> if isDesNotExistError e
+                               then loop n fs -- tail call keeps mask
+                               else throwIO e) $
+                do
+                    h <- openFile f ReadMode
+                    s <- hGetContents h
+                    loop (n + length (lines s)) fs
+    n <- loop 0 fs
+    print n
+
+-- GOOD (proper masking)
+main = do
+    fs <- getArgs
+    let
+        loop !n [] = return n
+        loop !n (f:fs) = do
+            getMaskingState >>= print
+            r <- Control.Exception.try (openFile f ReadMode)
+            case r of
+                Left e | isDoesNotExistError e -> loop n fs
+                       | otherwise -> throwIO e
+                Right h -> do
+                    s <- hGetContents h
+                    loop (n + length (lines s)) fs
+    n <- loop 0 fs
+    print n
+```
+
+The good version avoids accidental masking and keep exception handling local.
+
+### mask and forkIO
+
+`forkIO` creates threads that inherent parent's masking state.
+
+Need to handle exceptions in window between thread creation and exception handling.
+
+`forkFinally` provides safer pattern for common "do after thread completion" cases.
+
+Rule of thumb: if first hing in `forkIO` is exception handling, use `forkFinally`.
+
+Example:
+
+```Haskell
+-- BAD (has race condition)
+async :: IO a -> IO (Async a)
+async action = do
+    m <- newEmptyMVar
+    t <- forkIO (do r <- try action; putMVar m r) -- vulnerable window
+    return (Async t m)
+
+-- GOOD (safe)
+async action = do
+    m <- newEmptyMVar
+    t <- forkFinally action (putMVar m) -- handles completion safely
+    return (Async t m)
+```
+
+The good version uses `forkFinally` to safely handle thread completion
+and eliminate race conditions in exception handling.
+
+### Asynchronous Exceptions: Discussion
+
+Dealing with asynchronous exceptions at this level is something
+Haskell programmers rarely have to do:
+
+* All non-IO Haskell code is automatically safe by construction.
+  This makes asynchronous exceptions feasible.
+* We can use provided abstractions like `bracket` to acquire and release resources.
+  These have safety built in.
+  When working with `MVar`s, the `modifyMVar` family of ops also provides safety.
+
+Making omst IO monad code safe is straightforward, but for those
+cases where things get complicated, a few techniques simplify things:
+
+* Large chunks of heavily stateful code can be wrapped in a `mask`,
+  which drops into polling mode for asynchronous exceptions.
+* Using STM instead of `MVar`s or other state representations can sweep away all
+  the complexity in one go.
