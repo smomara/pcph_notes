@@ -2049,7 +2049,7 @@ Haskell programmers rarely have to do:
   These have safety built in.
   When working with `MVar`s, the `modifyMVar` family of ops also provides safety.
 
-Making omst IO monad code safe is straightforward, but for those
+Making most IO monad code safe is straightforward, but for those
 cases where things get complicated, a few techniques simplify things:
 
 * Large chunks of heavily stateful code can be wrapped in a `mask`,
