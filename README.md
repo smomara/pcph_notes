@@ -2617,3 +2617,237 @@ Benefits of STM:
    a transaction in progress is aborted if an exception occurs,
    so `STM` makes it easy to maintain invariants on state in the presence of
    exceptions.
+
+## Higher-Level Concurrency Abstractions
+
+We want to provide a way to create an Async that is automatically cancelled if its
+parent dies and then use this to build more compositional functionality.
+
+We will achieve this by building *trees of threads* such taht whenever a thread dies,
+two things happen: any children it has are automatically terminated and its parent
+is informed. So the tree is always collapsed from the bottom up and no threads
+are ever left running accidentally.
+
+### Avoiding Thread Leakage
+
+Let's review the API we have thus far:
+
+```Haskell
+data Async
+
+async :: IO a -> IO (Async a)
+cancel :: Async a -> IO ()
+
+waitCatchSTM :: Async a -> STM (Either SomeException a)
+waitCatch :: Async a -> IO (Either SomeException a)
+
+waitSTM :: Async a -> STM a
+wait :: Async a -> IO a
+
+waitEither :: Async a -> Async b -> IO (Either a b)
+```
+
+Let's make a way to create an Async that is automatically cancelled if the current
+thread dies. This is basically an exception handler that cancles the Async should
+an exception be raised. The general pattern for that with `bracket` is:
+
+```Haskell
+bracket (async io) cancel operation
+```
+
+where *io* is the IO action to perform asynchronously and *operation* is the code to
+execute while *io* is running. But this is a mouthful. Let's package it into
+a function instead:
+
+```Haskell
+withAsync :: IO a -> (Async a -> IO b) -> IO b
+withAsync io operation = bracket (async io) cancel operation
+```
+
+Here's an example:
+
+```Haskell
+main =
+    withAsync (getURL "[url1]") $ \a1 ->
+        withAsync (getURL "[url2]") -> do
+            r1 <- wait a1
+            r2 <- wait a2
+            print (B.length r1, B.length r2)
+```
+
+Now, the second Async is cleaned up if the first one fails.
+
+### Symmetric Concurrency Combinators
+
+The behavior in the last example is lopsided: if `a1` fails, then the alarm is raised
+immediately, but if `a2` fails, then the program waits for a result from `a1` before
+it notices the failure of `a2`.
+
+Let's make this symmetrical with `waitBoth`:
+
+```Haskell
+waitBoth :: Async a -> Async b -> IO (a,b)
+waitBoth a1 a2 =
+    atomically $ do
+        r1 <- waitSTM a1 `orElse` (do waitSTM a2; retry)
+        r2 <- waitSTM a2
+        return (r1,r2)
+```
+
+If `a1` throws an exception, `waitSTM` rethrows it.
+
+If `a1` retries, we go the the other argument of `orElse`,
+check for an exception in `a2`, then `retry`.
+
+If `a1` returns a value, we wait for `a2`.
+
+Now using `withAsync` and `waitBoth` we can build a nice symmetric function
+that runs two `IO` actions concurrently but aborts if either one fails with exception:
+
+```Haskell
+concurrently :: IO a -> IO b -> IO (a,b)
+concurrently ioa iob =
+    withAsync ioa $ \a ->
+    withAsync iob $ \b ->
+        waitBoth a b
+```
+
+Now we can rewrite the example:
+
+```Haskell
+main = do
+    (r1, r2) <- concurrently
+                    (getURL "[url1]")
+                    (getURL "[url2]")
+    print (B.length r1, B.length r2)
+```
+
+If we wanted to download a list of URLs, we can fold `concurrently` over
+a list, provided we use a small warapper to rebuild the results:
+
+```Haskell
+main = do
+    xs <- foldr conc (return []) (map getURL sites)
+    print (map B.length xs)
+  where
+    conc ioa ioas = do
+        (a,as) <- concurrently ioa ioas
+        return (a:as)
+```
+
+We can also create a helpful companion function that runs two `IO` actions
+concurrently, but cancels the other thread as soon as one finishes or
+throws an exception:
+
+```Haskell
+race :: IO a -> IO b -> IO (Either a b)
+race ioa iob =
+    withAsync ioa $ \a ->
+    withAsync iob $ \b ->
+        waitEither a b
+```
+
+`race` and `concurrently` are the essence of constructing trees of threads.
+If we use them consistently, we can ensure the tree of threads will always be
+collapsed from the bottom up:
+
+* If a parent throws an exception or receives an asynchronous exception,
+  the children are automatically cancelled recursively - if the children
+  have children, they will also be cancelled, and so on.
+* If one child receives an exception, then its sibling is also cancelled.
+* The parent chooses whether to wait for a result from both children or
+  just one by using `concurrently` or `race`.
+
+### Timeouts Using `race`
+
+A demonstration of the power of `race` is with an implementation of `timeout`:
+
+```Haskell
+timeout :: Int -> IO a -> IO (Maybe a)
+timeout n m
+    | n < 0 = fmap Just m
+    | n == 0 = return Nothing
+    | otherwise = do
+        r <- race (threadDelay n) m
+        case r of
+            Left _ -> return Nothing
+            Right a -> return (Just m)
+```
+
+### Adding a Functor Instance
+
+Currently, if our Asyncs don't all have the same result type,
+we can't put them in a list. A solution is to make Async an instance of `Functor`:
+
+```Haskell
+class Functor f where
+    fmap :: (a -> b) -> f a -> f b
+```
+
+The `fmap` operation lets us map the result of an Async into any type we need.
+
+Currently, the type of the result that the Async will place in the `TMVar` is fixed
+when we create the Async:
+
+```Haskell
+data Async a = Async ThreadId (TMVar (Either SomeException a))
+```
+
+Instead of storing the `TMVar` in the Async, we need to store something more
+compositional that we can compose with the function argument to `fmap` to change
+the result type. One solution is to replace the `TMVar` with an `STM` computation
+that returns the same type:
+
+```Haskell
+data Async a = Async ThreadId (STM (Either SomeException a))
+```
+
+This is a minor change, we only need to move the `readTMVar` call from
+`watiCatchSTM` to `async`:
+
+```Haskell
+async :: IO a -> IO (Async a)
+async action = do
+    var <- newEmptyTMVarIO
+    t <- forkFinally action (atomically . putTMVar var)
+    return (Async t (readTMVar var))
+
+waitCatchSTM :: Async a -> STM (Either SomeException a)
+waitCatchSTM (Async _ stm) = stm
+```
+
+And now we can define `fmap` by building a new `STM` computation that is composed
+from the old one and by applying the function argument of `fmap` to the result:
+
+```Haskell
+instance functor Async where
+    fmap f (Async t stm) = Async t stm'
+      where
+        stm' = do
+            r <- stm
+            case r of
+                Left e -> return (Left e)
+                Right a -> return (Right (f a))
+```
+
+### The Async API
+
+Let's summarize whats been achieved with our running Async example:
+
+* We started with a simple API to execute an `IO` action asynchronously (`async`)
+  and wait for its results (`wait`)
+* We modified the imlementation to catch exceptions in the asynchronous code
+  and propogate them to the `wait` call. This avoids a common error in
+  concurrent programming: forgetting to handle errors in a child thread.
+* We reimplemented the Async API using `STM`, which made it possible to have efficient
+  implementations of combinators that symmetrically wait for multiple Asyncs
+  to complete (`waitEither`, `waitBoth`).
+* We added `withAsync`, which avoids the accidental leakage of threads when an
+  exception occurs in the parent thread, avoiding another common pitfall in
+  concurrent programming.
+* Finally, we combined `withAsync` with `waitEither` and `waitBoth` to make high-level
+  symmetric combinators `race` and `concurrently`. These two operations can be used
+  to build trees of threads that are always collapsed from the bottom up and
+  to propogate errors correctly.
+
+This complete library is available in the `async` package on Hackage.
