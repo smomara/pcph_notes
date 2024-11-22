@@ -2056,3 +2056,564 @@ cases where things get complicated, a few techniques simplify things:
   which drops into polling mode for asynchronous exceptions.
 * Using STM instead of `MVar`s or other state representations can sweep away all
   the complexity in one go.
+
+## Software Transactional Memory
+
+**Software Transactional Memory (STM)**:
+a technique for simplifying concurrent programming by allowing
+multiple state-changing operations to be groups together and performed as
+a single atomic operation.
+
+Here's the STM interface:
+
+```Haskell
+data STM a -- abstract
+instace Monad STM -- among other things
+
+atomically :: STM a -> IO a
+
+data TVar a --abstract
+newTVar :: a -> STM (TVar a)
+readTVar :: TVar a -> STM a
+wrteTVar :: TVar a -> a -> STM ()
+
+retry :: STM a
+orElse :: STM a -> STM a -> STM a
+
+throwSTM :: Exception E => e -> STM a
+catchSTM :: Exception E => STM a -> (e -> STM a) -> STM a
+```
+
+### Running Example: Managing Windows
+
+Imagine a WM where the user can move windows from one desktop to another,
+while at the same time, a program can request that its own window move from its
+current desktop to another desktop. The WM uses multiple threads:
+one to listen for input from the user, a set of threads to listen for requests
+from programs running in each existing window, and one thread that renders the display.
+
+Let's assume some abstract types:
+
+```Haskell
+data Desktop -- abstract
+data Window -- abstract
+
+type Display = Map Desktop (MVar (Set Window))
+```
+
+We are bound to run into Dining Philosopher's problem when moving windows if
+there are converse `moveWindow` calls.
+
+STM provides a way to avoid this deadlock problem without imposing any
+requirements on the programmer. Lets replace `MVar` with `TVar`:
+
+```Haskell
+type Display = Map Desktop (TVar (Set Window))
+```
+
+A `TVar` is a transactional variable, a mutable variable that can be read or
+written only within the `STM` monad using `readTVar` and `writeTVar`.
+
+A computation in the `STM` monad can be performed in the `IO` monad,
+using the `atomically` function.
+
+When an `STM` computation is performed like this, its called a transaction
+because the whole operation takes place atomically with respect to the rest
+of the program - no other thread can observe an intermediate state.
+
+Let's implement `moveWindow` using `STM`:
+
+```Haskell
+moveWindowSTM :: Display -> Window -> Desktop -> Desktop -> STM ()
+moveWindowSTM disp win a b = do
+    wa <- readTVar ma
+    wb <- readTVar mb
+    writeTVar ma (Set.delete win wa)
+    writeTVar mb (Set.insert win wb)
+  where
+    ma = disp ! a
+    mb = disp ! b
+```
+
+Then, we wrap this in `atomically` to make the `IO`-monad version `moveWindow`:
+
+```Haskell
+moveWindow :: Display -> Window -> Desktop -> Desktop -> IO ()
+moveWindow disp win a b = atomically $ moveWindowSTM disp win a b
+```
+
+STM is far less error-prone here, and it scales to any number of `TVar`s.
+
+Now suppose, we want to swap two windows,
+moving window *W* from desktop *A* to *B*, and simulatenously *V* from *B* to *A*.
+We can do this neatly with STM by simply making two calls to `moveWindowSTM`:
+
+```Haskell
+swapWindows :: Display
+            -> Window -> Desktop
+            -> Window -> Desktop
+            -> IO ()
+swapWindows disp w a v b = atomically $ do
+    moveWindowsSTM disp w a b
+    moveWindowsSTM disp v b a
+```
+
+This shows the composability of STM operations:
+any operation of type `STM a` can be composed with others to form a
+larger atomic transaction. For this reason, `STM` operations are usually provided
+without the `atomically` wrapper so that we can compose them as necessary
+before finally wrapping everything in `atomically`.
+
+### Blocking
+
+STM uses `retry` to deal with *blocking* (when we need to wait for
+some condition to be true). `retry` tells STM computation to abandon the transaction
+and try again.
+
+Let's consider how to implement `MVar` using `STM` becuase `takeMVar` and
+`putMVar` need to be able to block when the `MVar` is empty or full.
+
+First the data type: an `MVar` is always in one of two states: full or empty:
+
+```Haskell
+newtype TMVar a = TMVar (Tvar (Maybe a))
+```
+
+To make an empty `TMVar`, we simply need a `TVar` containing `Nothing`:
+
+```Haskell
+newEmptyTMVar :: STM (TMVar a)
+newEmptyTMVar = do
+    t <- newTVar Nothing
+    return (TMVar t)
+```
+
+Now, to take `TMVar`s, we need to block if the desired variable is empty and
+return the content once the variable is set:
+
+```Haskell
+takeTMVar :: TMVar a -> STM a
+takeTMVar (TMVar t) = do
+    m <- readTVar t
+    case m of
+        Nothing -> retry
+        Just a -> do
+            writeTVar t Nothing
+            return a
+```
+
+`putTMVar` is pretty straightforward:
+
+```Haskell
+putTMVar :: TMVar a -> a -> STM ()
+putTMVar (TMVar t) a = do
+    m <- readTVar t
+    case m of
+        Nothing -> do
+            writeTVar t (Just a)
+            return ()
+        Just _ -> retry
+```
+
+Now, we can compose these `STM` operations:
+
+```Haskell
+atomically $ do
+    a <- takeTMVar ta
+    b <- takeTMVar tb
+    return (a,b)
+```
+
+Operating on two `MVar`s is more contrived, since taking a single one is a side-effect
+visible to the rest of the program, it can't be undone if the second `MVar` is empty
+but with `STM` we can continue to `retry` the entire transaction.
+
+### Blocking Until Something Changes
+
+`retry` allows us to block on arbitrary conditions.
+
+For example, say we want to render only the focused desktop
+while windows may move around and appear or disappear on their own accord,
+we would need to make sure the rendering thread updates accordingly.
+
+Let's define `render` and `getWindows` as helpers, then we'll see how
+`retry` blocks until something changes in the example:
+
+```Haskell
+-- handles rendering windows on display
+-- should be called whenever the layout changes
+render :: Set Window -> IO ()
+
+-- returns the set of windows to render
+-- given the Display and UserFocus
+getWindows :: Display -> UserFocus STM (Set Window)
+getWindows disp focus = do
+    desktop <- readTVar focus
+    readTVar (disp ! desktop)
+
+-- use retry to avoid calling render when nothing has changed
+renderThread :: Display -> UserFocus -> IO ()
+renderThread disp focus = do
+    wins <- atomically $ getWindows disp focus
+    loop wins
+  where
+    loop wins = do
+        render wins
+        next <- atomically $ do
+            wins' <- getWindows disp focus
+            if (wins == wins')
+                then retry
+                else return wins'
+        loop next
+```
+
+In `renderThread`, `retry` waits until the value read by `getWindows` could possibly
+be different (another thread completing a transaction that writes to one of the
+`TVar`s used by `getWindows`).
+
+Thanks to STM, we don't have to implement this complex logic ourselves,
+and can avoid many self-inflicted concurrency errors.
+
+### Merging with STM
+
+```Haskell
+orElse :: STM a -> STM a -> STM a
+```
+
+The operation `orElse a b` has the following behavior:
+
+* `a` is executed. If `a` has a result, the it's returned and `orElse` ends
+* If `a` calls `retry` instead, `a` is discarded and `b` is executed instead
+
+### Implementing Channels with STM
+
+The `STM` version of `Chan` is called `TChan`:
+
+```Haskell
+
+data TChan a = TChan (TVar (TVarList a))
+                     (TVar (TVarList a))
+
+type TVarList a = TVar (TList a)
+data TList a = TNil
+             | TCons a (TVarList a)
+
+newTChan :: STM (TChan a)
+newTChan = do
+    hole <- newTVar TNil
+    read <- newTVar hole
+    write <- newTVar hole
+    return (TChan read write)
+
+readTChan :: TChan a -> STM a
+readTChan (TChan readVar _) = do
+    listHead <- readTVar readVar
+    head <- readTVar listHead
+    case head of
+        TNil -> retry
+        TCons val tail -> do
+            writeTVar readVar tail
+            return val
+
+writeTChan :: TChan a -> a -> STM ()
+writeTChan (TChan _ writeVar) a = do
+    newListEnd <- newTVar TNil
+    listEnd <- readTVar writeVar
+    writeTVar writeVar newListEnd
+    writeTVar listEnd (TCons a newListEnd)
+```
+
+All the operations are in the STM monad, so they need to be wrapped in `atomically`
+but they can all be composed.
+
+The `TList` needs a `TNil` constructor to indicate an empty list;
+in the `MVar` implementation, the empty list was just an empty `MVar`.
+
+Blocking in `readTChan` is implemented by a call to `retry`.
+
+We didn't have to worry anywhere about what happens when a read executes
+concurrently with a write, because all operations are atomic.
+
+#### More Operations are Possible
+
+We can implement more operations thanks to STM:
+
+```Haskell
+unGetTChan :: TChan a -> a -> STM ()
+unGetTChan (TChan readVar _) a = do
+    listHead <- readTVar readVar
+    newHead <- newTVar (TCons a listHead)
+    writeTVar readVar newHead
+
+isEmptyTChan :: TChan a -> STM Bool
+isEmptyTChan (TChan read _) = do
+    listhead <- readTVar read
+    head <- readTVar listhead
+    case head of
+        TNil -> return True
+        TCons _ _ -> return False
+```
+
+#### Composition of Blocking Operations
+
+Since operations in STM can be composed togethre, we can build composite operations
+like `readEitherTChan`:
+
+```Haskell
+readEitherTChan :: TChan a -> TChan b -> STM (Either a b)
+readEitherTChan a b =
+    fmap Left (readTChan a)
+        `orElse`
+    fmap Right (readTChan b)
+```
+
+#### Asynchronous Exception Safety
+
+`STM` supports exceptions much like the `IO` monad, with two operations:
+
+```Haskell
+throwSTM :: Exception e => e -> STM a
+catchSTM :: Exception e => STM a -> (e -> STM a) -> STM a
+```
+
+`throwSTM` throws an exception, and `catchSTM` catches exceptions and invokes
+a handler.
+
+In `catchSTM m h` if `m` raises an exception, then *all of its effects are
+discarded*, and the nthe handler `h` is invoked.
+If there is no enclosing `catchSTM` at all, then all of the transactions
+effects are discarded and the exception is propogated out of `atomically`.
+
+Here's an example to understand the motivatoin for this behavior:
+
+```Haskell
+readCheck :: TChan a -> STM a
+readCheck chan = do
+    a <- readTChan chan
+    checkValue a
+```
+
+Where `checkValue` is an operatoins that imposes some constraint on the value read.
+Now suppose `checkValue` raises an exception, we would prefer if the
+`readTChan` had not happened because an element of the channel would be lost.
+Furthermore, we would like `readCheck` to have this behavior regardless of
+if there's an enclosing exception handler or not. Hence, `catchSTM` discards
+the effects of its first argument if there's an exception.
+
+The discarding-effects is very useful for asynchronous exceptions.
+In most cases, asynchronous exception safety in the STM consists of doing
+*absolutely nothing at all*. There are no locks to replace, no need for handlers,
+no need for `bracket` or worrying about which critical sections to `mask`.
+
+### An Alternative Channel Implementation
+
+The flexibility of `STM` gives us more choices in how to construct channels,
+we don't have to implement the same way as we did with `MVar`.
+
+An `STM` operation can block on any condition whatsoever, so we can
+represent channel contents in any data structure we want, even a simple list:
+
+```Haskell
+newtype TList a = TList (TVar [a])
+
+newTList :: STM (TList a)
+newTList = do
+    v <- newTVar []
+    return (TList v)
+
+writeTList :: TList a -> a -> STM ()
+writeTList (TList v) a = do
+    list <- readTVar v
+    writeTVar v (list ++ [a])
+
+readTList :: TList a -> STM a
+readTList (TList v) = do
+    xs <- readTVar v
+    case xs of
+        [] -> retry
+        (x:xs') -> do
+            writeTVar v xs'
+            return x
+```
+
+This abstraction has the exact same behavior as `TChan`.
+The problem with this representation, though, is that Haskell uses linked lists
+as its list datatype, so adding to the *end* of the list is an *O(n)* operation.
+We can just create a queue data structure with *O(1)* enqueue and dequeue:
+
+```Haskell
+data TQueue a = TQueue (TVar [a]) (TVar [a])
+
+newTQueue :: STM (TQueue a)
+newTQueue = do
+    read <- newTVar []
+    write <- newTVar []
+    return (TQueue read write)
+
+writeTQueue :: TQueue a -> a -> STM ()
+writeTQueue (TQueue _read write) a = do
+    listend <- readTVar write
+    writeTVar write (a:listend)
+
+readTQueue :: TQueue a -> STM a
+readTQueue (TQueue read write) = do
+    xs <- readTVar read
+    case xs of
+        (x:xs') -> do writeTVar read xs'
+                      return x
+        [] -> do ys <- readTVar write
+                 case ys of
+                    [] -> retry
+                    _ -> do let (z:zs) = reverse ys
+                            writeTVar write []
+                            writeTVar read zs
+                            return z
+```
+
+*Note: for more details on these kinds of data structure,
+read Okasaki's Purely Functional Data Structures (1999)*
+
+Note the importance of the`reverse` being executed lazily with a let rather than
+a case pattern match. We want it to be lazy so that the STM transaction
+completes without having to do the `reverse`.
+
+### Bounded Channels
+
+Unbounded channels (`Chan` and `TChan`) can grow without bound if the reading
+threads dont keep up with the writing threads, creating space issues.
+
+Bounded channels (`MVar` and `TVar`) are limited by concurrency - if there
+is a burst of writing activity, the writers will block waiting for the readers
+to catch up.
+
+A bounded channel is in between these two implementations with a limit on the size,
+absorbing burst of writing activity without risking using too much memory.
+
+Let's implement one with `STM`:
+
+```Haskell
+data TBQueue = TBQueue (TVar int) (TVar [a]) (TVar [a])
+
+newTBQueue :: Int -> STM (TBQueue a)
+newTBQueue size = do
+    read <- newTVar []
+    write <- newTVar []
+    cap <- newTVar size
+    return (TBQueue cap read write)
+
+writeTBQueue :: TBQueue a -> a -> STM ()
+writeTBQueue (TBQueue cap _read write) a = do
+    avail <- readTVar cap
+    if avail == 0
+        then retry
+        else writeTVar cap (avail -1)
+    listend <- readTVar write
+    writeTVar write (a:listend)
+
+readTBQueue :: TBQueue a -> STM a
+readTBQueue (TBQueue cap read write) a = do
+    avail <- readTVar cap
+    writeTVar cap (avail + 1)
+    xs <- readTVar read
+    case xs of
+        (x:xs') -> do writeTVar read xs'
+                      return x
+        [] -> do ys <- readTVar write
+                 case ys of
+                    [] -> retry
+                    _ -> do let (z:zs) = reverse ys
+                            writeTVar write []
+                            writeTVar read zs
+                            return z
+```
+
+### What Can We Not Do with STM?
+
+`MVar` is faster than STM, but we should not always assume using `MVar` will result
+in faster code. For example `TList` (`STM`) outperforms `Chan` (`MVar`) and
+`TList` has the advantage of being composable.
+
+`MVar` also has the advantage of *fairness*: when multiple threads block on an `MVar`,
+they are guaranteed to be woken up in FIFO order, and no single thread can be blocked
+in `takeMVar` indefinitely.
+
+In constrast, when multiple threads are blocked in STM transactions that depend
+on a particular `TVar`, and the `TVar` is modified by another thread, it is not
+enough to just wake up one of the blocked transactions - the runtime wakes them all.
+Since a transaction can block on any arbitrary condition, the runtime doesn't know
+what to wake up and in what order.
+
+We can't implement fairness without sacrificing composability.
+
+### Performance
+
+If we can understand the cost of STM, we can avoid code that hits the bad cases.
+
+An `STM` transaction works by keeping a *log* of `readTVar` and `writeTVar`
+operations that have happened so far during the transaction. The log is used 3 ways:
+
+1. Storing `writeTVar` operations in the log rather than immediately applying
+   them in memory makes discarding the effects easy. So absorbing a
+   transaction has a fixed small cost.
+2. Each `readTVar` must traverse the log to check whether the `TVar` was
+   written by an earlier `writeTVar`.
+   Hence, `readTVar` is an *O(n)* operation in the length of the log.
+3. The log contains a record of all the `readTVar` operations, so
+   it can be used to discover the full set of `TVar`s read during the transaction,
+   which we need to know in order to implement `retry`.
+
+If the log matches the contents of memory at the end of an `STM` transaction,
+the effects are *committed*, if not the log is discarded and we retry.
+
+`STM` locks all `TVar`s involved in the transaction, but does not use global locks.
+So two disjoint transactions can occur at the same time.
+
+There are two important rules of thumb:
+
+1. Never read an unbounded number of `TVar`s because the *O(n)* performance
+   of `readTVar` gives *O(n^2)* for the whole transaction.
+2. Try to avoid expensive evaluatoin inside a transaction because this will
+   make the transaction take a long time, increasing the chance that another
+   transaction will modify one or more of the same `TVar`s, causing the
+   current transaction to be discarded and re-executed. In the worst case,
+   a long transaction re-executes indefinitely because it is repeatedly
+   aborted by shorter transactions.
+
+`retry` uses the log to find out which `TVar`s were accessed by the transaction,
+so it can trigger a rerun if any of them are changed.
+So each `TVar` has a 'watch list' of threads that should be woken up if it's modified.
+`retry` adds its thread to the `TVar`'s 'watch list'.
+Hence, `retry` is *O(n)* in the number of `TVar`s read during the transaction.
+
+Another thing to be careful about is composing too many blocking operations together.
+For example, if we wanted to wait for a list of `TMVar`s to become full,
+we might want to do this:
+
+```Haskell
+atomically $ mapM takeMVar ts
+```
+
+This is *O(n^2)* since we do the *O(n)* `takeMVar` *n* times (for each element)
+after each `retry`. On the other hand this implementation is *O(n)*:
+
+```Haskell
+mapM (atomically . takeMVar) ts
+```
+
+and will be much faster.
+
+### Summary
+
+Benefits of STM:
+
+1. **Composable atomicity**:
+   able to construct arbitrarily large atomic operations on shared state,
+   simplifying implementations of concurrent data structures with fine-grained
+   locking.
+2. **Composable blocking**:
+   able to build operatoins that choose between multiple blocking operations,
+   which is very difficult with `MVar`s and other low-level concurrency abstractions.
+3. **Robustness in the presence of failure and cancellation**:
+   a transaction in progress is aborted if an exception occurs,
+   so `STM` makes it easy to maintain invariants on state in the presence of
+   exceptions.
