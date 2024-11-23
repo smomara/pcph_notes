@@ -2851,3 +2851,271 @@ Let's summarize whats been achieved with our running Async example:
   to propogate errors correctly.
 
 This complete library is available in the `async` package on Hackage.
+
+## Concurrent Network Servers
+
+Server-type applications that communicate with many clients simultaneously demand
+a high degree of concurrency *and* high performance from the I/O subsystem.
+
+Threads allow the developer to focus on programming the interaction with a single
+client and the nto list this interaction to multiple clients by simply forking
+many instances of the single-client interactoin in separate threads.
+
+### A Trivial Server
+
+We will build a simple network server with the following behavior:
+
+* The server accepts connections from clients on port 44444
+* If a client sends an integer *n*, then the service responds with *2n*
+* If a client sends the string "end", then the server closes the connection
+
+First, we program the interaction with a single client. The function `talk` takes
+a `Handle` for communicating with the client. The `Handle` will be bound to a
+network socket so that data sent by the client can be read from the `Handle` and
+vice versa:
+
+```Haskell
+talk :: Handle -> IO ()
+talk h = do
+    hSetBuffering h LineBuffering
+    loop
+  where
+    loop = do
+        line <- hGetLine h
+        if line == "end"
+            then hPutStrLn h ("Thank you for using the Haskell doubling service.")
+            else do
+                hPutStrLn h (show (2 * (read line :: Integer)))
+                loop
+```
+
+Having dealt with the interaction wit ha single lcient, we can now make this into
+a multiclient server using concurrency. The `main` function is as follows:
+
+```Haskell
+port :: Int
+port = 44444
+
+main = withSocketsDo $ do
+    sock <- listenOn (PortNumber (fromIntegral port))
+    printf "Listening on port %d\n" port
+    forever $ do
+        (handle, host, port) <- accept sock
+        printf "Accepted connection from %s: %s\n" host (show port)
+        forkFinally (talk handle) (\_ -> hclose handle)
+```
+
+This is super simple and ignores many details necessary in a real server.
+
+### Extending the Simple Server with State
+
+The new behavior is as follows:
+instead of multiplying each number by two, the server will multiply each number
+by the *current factor*. Any connected client can change the current factor by
+sending the command `*N` where `N` is an integer. When a client changes the factor,
+the server sends a message to all the other connected clients informing them
+of the change.
+
+This introduces some challenges:
+
+* There is shared state
+* When one thread changes the state, we must send a message to all connected clients
+
+Let's explore the design space.
+
+#### Design One: One Giant Lock
+
+The simplest approach is a global lock for the state under a single `MVar`:
+
+```Haskell
+data State = State {
+    currentFactor :: Int,
+    clientHandles :: [Handle]
+}
+
+newType StateVar = StateVar (MVar State)
+```
+
+This design means every server thead, when it needs to send a message to its client,
+must hold the `MVar` while sending the message.
+
+The disadvantage is that there will be lots of contention for the shared state.
+There's not enough concurrency.
+
+#### Design Two: One Chan Per Server Thread
+
+To add more concurrency, we want to design the system so that each server thread
+can communicate with its client privately without interacting with the other
+server threads. So, the `Handle` for communicating with the client must be private
+to each server thread.
+
+The factor-change command still has to notify all the clients, but since the server
+thread is the only thread allowed to communicate with a client, we must send a message
+to all the server threads when a factor-change occurs. So each server thread must have
+a `Chan` on which it receives messages:
+
+```Haskell
+data State = State {
+    clientChans :: [Chan Message]
+}
+
+data Message
+    = FactorChange Int
+    | ClientInput String
+
+newType StateVar = StateVar (MVar State)
+```
+
+The `Message` type combines the two events so that the `Chan` can carry either.
+
+We need another thread for each server thread whose sole job is to receive
+input from the client's `Handle` and forward them to the `Chan` in the form of
+`ClientInput` events. This is the "receive thread".
+
+This design is an improvement, but still has a drawback:
+a server thread that receives a factor-change command must iterate over
+a whole list of `Chan`s sending a message to each one, and this must be done
+with the lock held, again for atomicity reasons. Furthermore, we have to
+keep the list of `Chan`s up to date when clients connect and disconnect.
+
+#### Design THree: Use a Broadcast Chan
+
+To solve the issue that notifying all the clients requires a walk
+over the list of `Chan`s, we can use a broadcast channel that we create a copy of
+for each server thead. When an item is written to the broadast channel, it will
+appear on all the copies.
+
+The only shared state in this design is a single broadcast channel,
+which doesn't even need to be stored in an `MVar` (it never changes).
+The messages sent on the broadcast channel are new factor values.
+
+```Haskell
+newtype State = State { broadcastChan :: Chan Int }
+```
+
+There's an issue with this design. The server thread must listen both for
+events on the broadcast channel and for input from the client.
+To merge these two events, we'll need a `Chan` as in the previous design, a receive
+thread to forward the client's input, and another thread to forward messages
+from the broadcast channel.
+So we need three threads per client.
+
+#### Design Four: Use STM
+
+*Ah, the silver bullet.*
+
+We can use STM, avoiding the broadcast channel, by storing the current factor
+in a single shared `TVar`:
+
+```Haskell
+newtype State = State { currentFactor :: TVar Int }
+```
+
+An STM transaction can block until something changes in the `TVar`s value,
+so we don't need to explicitly send messages when it changes, just change it.
+
+We can also merge multiple sources of events in STM without using extra threads.
+We do need a receive thread to forward input form the client because an STM
+transaction can't wait for IO, but that's all. So we only need two threads per client.
+
+Let's walk through what happens when a client send a factor-change command:
+
+1. The receive thread reads the command from the `Handle`,
+   and forwards it to the server thread's `TChan`.
+2. The server thread receives the command on its `TChan` and
+   modifies the shared `TVar`.
+3. The change is noticed by the other server threads, which report the new value
+   to its clients.
+
+#### The Implementation
+
+```Haskell
+main = withSocketsDo $ do
+    sock <- listenOn (PortNumber (fromIntegral port))
+    printf "Listening on port %d\n" port
+    factor <- atomically $ newTVar 2
+    forever $ do
+        (handle, host, port) <- accept sock
+        printf "Accepted connection rom %s: %s\n" host (show port)
+        forkFinally (talk handle factor) (\_ -> hClose handle)
+
+talk :: Handle -> TVar Integer -> IO ()
+talk h factor = do
+    hSetBuffering h LineBuffering
+    c <- atomically newTChan
+    race (server h factor c) (receive h c)
+    return ()
+
+recieve :: Handle -> TChan String -> IO ()
+receive h c = forever $ do
+    line <- hGetLine h
+    atomically $ writeTChan c line
+
+server :: Handle -> TVar Integer -> TChan String -> IO ()
+server h factor c = do
+    f <- atomically $ readTVar factor
+    hPrintf h "Current factor: %d\n" f
+    loop f
+  where
+    loop f = do
+        action <- atomically $ do
+            f' <- readTVar factor
+            if (f /= f')
+               then return (newFactor f')
+               else do
+                    l <- readTChan c
+                    return (command f l)
+        action
+
+    newFactor f = do
+        hPrintf h "new factor: %d\n" f
+        loop f
+
+    command f s
+        = case s of
+            "end" ->
+                hPutStrLn ("Thank you for using the Haskell doubling service.")
+            '*':s -> do
+                atomically $ writeTVar factor (read s :: Integer)
+                loop f
+            line -> do
+                hPutStrLn h (show (f * (read line :: Integer)))
+                loop f
+```
+
+### A Chat Server
+
+Creating a single channel chat server with the following specifications:
+
+* The server requests the name of each client that connects.
+  The client must choose a name not in use, or the server requests new name.
+* Each line received from the client is interpreted as a command:
+  * `/tell name message`: Sends *message* to the user *name*.
+  * `/kick name`: Disconnects user *name*.
+  * `/quit`: Disconnects the current client.
+  * `message`: Any other string is broadcast as a message to all connected clients.
+* All connected clients are notified when another client joins or leaves.
+* Error handling and consistent behavior.
+  * If two join at the same time, one joins first.
+  * If two kick each other, one will succeed.
+
+#### Architecture
+
+Requirements dictate that a server thread must act on events from multiple sources:
+input form the client over the network,
+`/tell` messages and broadcasts from other clients,
+being kicked by another client, and
+clients connecting or disconnecting.
+
+Basic architecture will be similar to the chat server.
+We need a receive thread to forward the network input into a `TChan` and
+a server thread to wait for the different kinds of events and act upon them.
+
+We will have a lot more shared state than the previous exapmle, though.
+A client needs to send messages to other clients, so the set of clients
+and their corresponding `TChan`s must be shared.
+
+A complete implementation chan be found in `chat.hs`.
+Our implementation uses a broadcast channel so that `broadcast` does not operate
+on an ubouned number of client `TChan`s since that leads to *O(n^2)* performance
+as noted before.
